@@ -10,6 +10,8 @@ Usage:
 
 import numpy as np
 import pandas as pd
+from scipy.special import logsumexp
+from scipy.stats import multivariate_normal
 
 # ── Prior bounds ───────────────────────────────────────────────────────────────
 PRIOR_BETA  = (0.05, 0.50)
@@ -186,3 +188,317 @@ def abc_rejection(s_obs_norm, sims_norm, params, stat_indices, acceptance_rate=0
     threshold = np.sort(distances)[n_accept]
     mask      = distances <= threshold
     return params[mask], mask, threshold
+
+
+# ── SMC-ABC utilities ─────────────────────────────────────────────────────────
+def distance_fn(s_sim, s_obs, scale=None):
+    """Euclidean distance, with optional per-summary scaling."""
+    s_sim = np.asarray(s_sim, dtype=float)
+    s_obs = np.asarray(s_obs, dtype=float)
+    diff = s_sim - s_obs
+
+    if scale is not None:
+        scale = np.asarray(scale, dtype=float)
+        scale = np.where(scale == 0, 1.0, scale)
+        diff = diff / scale
+
+    return float(np.linalg.norm(diff))
+
+
+def sample_prior(rng, prior_bounds=None):
+    """Draw one parameter vector from independent uniform priors."""
+    if prior_bounds is None:
+        prior_bounds = np.array([PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO], dtype=float)
+
+    return np.array([
+        rng.uniform(low, high) for low, high in prior_bounds
+    ], dtype=float)
+
+
+def in_prior_support(theta, prior_bounds=None):
+    """Check whether theta lies inside prior support."""
+    if prior_bounds is None:
+        prior_bounds = np.array([PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO], dtype=float)
+
+    theta = np.asarray(theta, dtype=float)
+    return bool(np.all((theta >= prior_bounds[:, 0]) & (theta <= prior_bounds[:, 1])))
+
+
+def prior_pdf(theta, prior_bounds=None):
+    """Joint prior density for independent uniforms."""
+    if prior_bounds is None:
+        prior_bounds = np.array([PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO], dtype=float)
+
+    if not in_prior_support(theta, prior_bounds=prior_bounds):
+        return 0.0
+
+    widths = prior_bounds[:, 1] - prior_bounds[:, 0]
+    return float(np.prod(1.0 / widths))
+
+
+def perturb_theta(theta, cov, rng, prior_bounds=None):
+    """Gaussian random-walk proposal with support check."""
+    if prior_bounds is None:
+        prior_bounds = np.array([PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO], dtype=float)
+
+    theta = np.asarray(theta, dtype=float)
+    try:
+        proposal = rng.multivariate_normal(theta, cov, check_valid="ignore")
+    except Exception:
+        return None
+
+    if not in_prior_support(proposal, prior_bounds=prior_bounds):
+        return None
+
+    return proposal
+
+
+def weighted_cov(X, w):
+    """Numerically stable weighted covariance."""
+    X = np.asarray(X, dtype=float)
+    w = np.asarray(w, dtype=float)
+    w = np.clip(w, 0.0, None)
+    total = np.sum(w)
+    if not np.isfinite(total) or total <= 0:
+        w = np.full(len(w), 1.0 / len(w), dtype=float)
+    else:
+        w = w / total
+
+    mean = np.sum(X * w[:, None], axis=0)
+    Xm = X - mean
+    denom = 1.0 - np.sum(w ** 2)
+    if denom <= 1e-12:
+        denom = 1.0
+
+    cov = (Xm * w[:, None]).T @ Xm / denom
+    return 0.5 * (cov + cov.T)
+
+
+def ess(weights):
+    """Effective sample size from normalized importance weights."""
+    weights = np.asarray(weights, dtype=float)
+    weights = np.clip(weights, 0.0, None)
+    total = np.sum(weights)
+    if not np.isfinite(total) or total <= 0:
+        return 0.0
+
+    weights = weights / total
+    return float(1.0 / np.sum(weights ** 2))
+
+
+def _stabilize_cov(cov, jitter=1e-9):
+    """Symmetrize and jitter covariance matrix."""
+    cov = np.asarray(cov, dtype=float)
+    cov = 0.5 * (cov + cov.T)
+    scale = max(1.0, float(np.trace(cov)) / cov.shape[0])
+    return cov + (jitter * scale) * np.eye(cov.shape[0])
+
+
+def _kernel_mixture_logpdf(theta, particles_prev, weights_prev, cov):
+    """Log density of SMC proposal mixture at theta."""
+    log_terms = []
+    for theta_prev, weight_prev in zip(particles_prev, weights_prev):
+        if weight_prev <= 0:
+            continue
+        try:
+            log_density = multivariate_normal.logpdf(
+                theta,
+                mean=theta_prev,
+                cov=cov,
+                allow_singular=True,
+            )
+        except Exception:
+            continue
+
+        if np.isfinite(log_density):
+            log_terms.append(np.log(weight_prev) + log_density)
+
+    if not log_terms:
+        return -np.inf
+
+    return float(logsumexp(log_terms))
+
+
+def smc_abc(
+    n_particles,
+    eps_schedule,
+    simulate_fn,
+    summary_fn,
+    s_obs,
+    rng,
+    scale=None,
+    max_tries_per_particle=10000,
+    eps_quantiles=None,
+    prior_bounds=None,
+):
+    """
+    Sequential Monte Carlo ABC with optional adaptive epsilon quantiles.
+
+    eps_schedule:
+        - Full sequence [eps0, eps1, ...], or
+        - [eps0] with eps_quantiles controlling later populations.
+    """
+    if prior_bounds is None:
+        prior_bounds = np.array([PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO], dtype=float)
+
+    eps_schedule = np.atleast_1d(np.asarray(eps_schedule, dtype=float))
+    if eps_schedule.ndim != 1 or len(eps_schedule) == 0:
+        raise ValueError("eps_schedule must contain at least one tolerance")
+
+    if eps_quantiles is None:
+        eps_quantiles = []
+    eps_quantiles = np.asarray(eps_quantiles, dtype=float)
+
+    fixed_mode = len(eps_schedule) > 1
+    if fixed_mode and len(eps_quantiles) > 0:
+        raise ValueError("Use either a full eps_schedule or eps_schedule[0] + eps_quantiles")
+
+    if fixed_mode:
+        n_pops = len(eps_schedule)
+    else:
+        n_pops = 1 + len(eps_quantiles)
+
+    s_obs = np.asarray(s_obs, dtype=float)
+
+    particles_list = []
+    weights_list = []
+    distances_list = []
+    summaries_list = []
+    acceptance_rates = []
+    covariances = []
+    eps_used = []
+
+    # Population 0: rejection from prior.
+    eps0 = float(eps_schedule[0])
+    eps_used.append(eps0)
+
+    pop_particles = []
+    pop_distances = []
+    pop_summaries = []
+    total_tries = 0
+
+    for i in range(n_particles):
+        accepted = False
+        tries = 0
+
+        while not accepted:
+            tries += 1
+            total_tries += 1
+            if tries > max_tries_per_particle:
+                raise RuntimeError(
+                    f"Population 0, particle {i}: exceeded max_tries_per_particle={max_tries_per_particle}"
+                )
+
+            theta = sample_prior(rng, prior_bounds=prior_bounds)
+            sim_data = simulate_fn(theta, rng)
+            s_sim = np.asarray(summary_fn(sim_data), dtype=float)
+            dist = distance_fn(s_sim, s_obs, scale=scale)
+
+            if dist <= eps0:
+                pop_particles.append(theta)
+                pop_distances.append(dist)
+                pop_summaries.append(s_sim)
+                accepted = True
+
+    particles = np.asarray(pop_particles, dtype=float)
+    weights = np.full(n_particles, 1.0 / n_particles, dtype=float)
+    distances = np.asarray(pop_distances, dtype=float)
+    summaries = np.asarray(pop_summaries, dtype=float)
+
+    particles_list.append(particles)
+    weights_list.append(weights)
+    distances_list.append(distances)
+    summaries_list.append(summaries)
+    acceptance_rates.append(n_particles / total_tries)
+    covariances.append(None)
+
+    # Populations t >= 1: perturb + reweight.
+    for t in range(1, n_pops):
+        prev_particles = particles_list[-1]
+        prev_weights = weights_list[-1]
+        kernel_cov = _stabilize_cov(2.0 * weighted_cov(prev_particles, prev_weights))
+
+        if fixed_mode:
+            eps_t = float(eps_schedule[t])
+        else:
+            q = float(eps_quantiles[t - 1])
+            eps_t = float(np.quantile(distances_list[-1], q))
+        eps_used.append(eps_t)
+
+        pop_particles = []
+        pop_log_weights = []
+        pop_distances = []
+        pop_summaries = []
+        total_tries = 0
+
+        for i in range(n_particles):
+            accepted = False
+            tries = 0
+
+            while not accepted:
+                tries += 1
+                total_tries += 1
+                if tries > max_tries_per_particle:
+                    raise RuntimeError(
+                        f"Population {t}, particle {i}: exceeded max_tries_per_particle={max_tries_per_particle}"
+                    )
+
+                parent_idx = rng.choice(len(prev_particles), p=prev_weights)
+                theta = perturb_theta(
+                    prev_particles[parent_idx],
+                    kernel_cov,
+                    rng,
+                    prior_bounds=prior_bounds,
+                )
+                if theta is None:
+                    continue
+
+                sim_data = simulate_fn(theta, rng)
+                s_sim = np.asarray(summary_fn(sim_data), dtype=float)
+                dist = distance_fn(s_sim, s_obs, scale=scale)
+
+                if dist <= eps_t:
+                    log_prior = np.log(max(prior_pdf(theta, prior_bounds=prior_bounds), 1e-300))
+                    log_denom = _kernel_mixture_logpdf(theta, prev_particles, prev_weights, kernel_cov)
+                    log_weight = log_prior - log_denom
+
+                    pop_particles.append(theta)
+                    pop_log_weights.append(log_weight)
+                    pop_distances.append(dist)
+                    pop_summaries.append(s_sim)
+                    accepted = True
+
+        pop_particles = np.asarray(pop_particles, dtype=float)
+        pop_log_weights = np.asarray(pop_log_weights, dtype=float)
+        pop_distances = np.asarray(pop_distances, dtype=float)
+        pop_summaries = np.asarray(pop_summaries, dtype=float)
+
+        if np.any(~np.isfinite(pop_log_weights)):
+            pop_weights = np.full(n_particles, 1.0 / n_particles, dtype=float)
+        else:
+            pop_log_weights = pop_log_weights - logsumexp(pop_log_weights)
+            pop_weights = np.exp(pop_log_weights)
+
+        pop_weights = np.clip(pop_weights, 0.0, None)
+        weight_total = np.sum(pop_weights)
+        if not np.isfinite(weight_total) or weight_total <= 0:
+            pop_weights = np.full(n_particles, 1.0 / n_particles, dtype=float)
+        else:
+            pop_weights = pop_weights / weight_total
+
+        particles_list.append(pop_particles)
+        weights_list.append(pop_weights)
+        distances_list.append(pop_distances)
+        summaries_list.append(pop_summaries)
+        acceptance_rates.append(n_particles / total_tries)
+        covariances.append(kernel_cov)
+
+    return {
+        "particles": particles_list,
+        "weights": weights_list,
+        "distances": distances_list,
+        "summaries": summaries_list,
+        "acceptance_rates": acceptance_rates,
+        "covariances": covariances,
+        "eps_schedule": np.asarray(eps_used, dtype=float),
+    }
