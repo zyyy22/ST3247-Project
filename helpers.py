@@ -28,8 +28,7 @@ SUMMARY_NAMES = [
 ]
 
 # Best summary subset index (from forward selection in ST3247_ABC_v2)
-FINAL_JOINT = [17, 13, 1, 9, 8, 10, 3, 4, 16]
-
+FINAL_JOINT = [3, 15, 10, 5, 4, 6, 2, 7, 12, 0, 17, 18, 13, 8, 1, 19]
 
 def calc_summaries(infected_fraction, rewire_counts, degree_histogram):
     """
