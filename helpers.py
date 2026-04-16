@@ -5,7 +5,8 @@ Import this in any notebook instead of copy-pasting functions around.
 Usage:
     from helpers import (calc_summaries, SUMMARY_NAMES, load_observed_summaries,
                          sample_prior_theta, generate_prior_bank,
-                         abc_rejection, PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO)
+                         abc_rejection, PRIOR_BETA, PRIOR_GAMMA, PRIOR_RHO,
+                         distance_fn, sample_prior, weighted_cov, ess, smc_abc)
 """
 
 import numpy as np
